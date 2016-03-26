@@ -1,7 +1,12 @@
 # load pdxredditdd.py
+# handle iframes from youtube
+# fix that:
+# TODO: deal with image thumbnails
+# TODO: implement a checker for diary updates
 
 import os.path
 import json
+import configparser
 import re
 import logging
 from dateutil.parser import parse
@@ -14,6 +19,9 @@ from bs4 import BeautifulSoup
 from imgurpython import ImgurClient
 from apscheduler.schedulers.blocking import BlockingScheduler
 
+import webbrowser
+import os
+
 logging.basicConfig(filename='log.log',
 					filemode='a',
 					format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
@@ -23,16 +31,17 @@ logging.basicConfig(filename='log.log',
 class Routine:
 	def __init__(self):
 		self.config_address = 'config.json'
-		self.checked_diaries_address = 'checked_diaries.json'
+		self.checked_articles_address = 'checked_articles.json'
 		with open(self.config_address) as json_file:
-			self.config = json.load(json_file)
+				self.config = json.load(json_file)
 
 		checked = []
-		if os.path.isfile(self.checked_diaries_address):
-			with open(self.checked_diaries_address) as json_file:
+		if os.path.isfile(self.checked_articles_address):
+			with open(self.checked_articles_address) as json_file:
 				checked = json.load(json_file)
 
-		self.imgur_reuploader = ImgurReuploader(self.config["imgur"]["client_id"], self.config["imgur"]["client_secret"])
+		self.diaries = Diary.load_from_json()
+		self.imgur_reuploader = ImgurReuploader()
 		self.diaryChecker = DiaryChecker(self.config["forum"]["front_page_url"], self.config["forum"]["article_prefix"], checked)
 		self.fresh_diaries = []
 
@@ -41,14 +50,20 @@ class Routine:
 		self.fresh_diaries += self.diaryChecker.check_for_new_articles()
 		for diary in self.fresh_diaries:
 			self.fetch_and_post(diary, self.config["praw"]["resubmit"], self.config["praw"]["raise_captcha_exception"])
+			self.diaries.append(diary)
 		self.fresh_diaries = [ self.fresh_diaries for diary in self.fresh_diaries if not diary.posted ]
 		self.save_checked_to_file()
+		Diary.save_to_json(self.diaries)
 
 	def save_checked_to_file(self):
-		with open(self.checked_diaries_address, 'w') as outfile:
+		with open(self.checked_articles_address, 'w') as outfile:
 			json.dump(self.diaryChecker.checked, outfile)
 
 	def fetch_and_post(self, diary, resubmit, raise_captcha_exception):
+		##################################################################
+		# weburl = 'https://en.wikipedia.org/wiki/Main_Page'
+		# webbrowser.open(weburl, new=2, autoraise=True)
+		##################################################################
 		try:
 			diaryFetcher = DiaryFetcher(diary, self.imgur_reuploader)
 		except requests.exceptions.RequestException as e:
@@ -62,10 +77,8 @@ class Routine:
 				return
 
 		diaryPoster = DiaryPoster(user_agent=self.config['praw']['user_agent'],
-								  client_id=self.config['praw']['client_id'],
-								  client_secret=self.config['praw']['client_secret'],
-								  resubmit=self.config['praw']['resubmit'],
-								  raise_captcha_exception=self.config['praw']['raise_captcha_exception'])
+								  resubmit=resubmit,
+								  raise_captcha_exception=raise_captcha_exception)
 
 		for subreddit in self.config["subreddits"]:
 			if subreddit["all_games"] or diary.name in subreddit["games"]:
@@ -76,11 +89,35 @@ class Routine:
 					logging.info('Successfully posted at: ' + str(datetime.utcnow()))
 
 class Diary:
-	def __init__(self, id=None, url=None):
+	def __init__(self, id=None, url=None, submission_id=None, comments=[]):
 		self.id = id
 		self.url = url
 		self.posted = False
-		
+		self.submission_id = submission_id
+		self.comments = comments
+
+	@staticmethod
+	def save_to_json(diaries):
+		diaries_address = 'diaries.json'
+		json_data = []
+		for diary in diaries:
+			json_data.append({'id': diary.id, 'url': diary.url, 'submission_id': diary.submission_id, 'comments': diary.comments})
+		with open(diaries_address, 'w') as json_file:
+			json.dump(json_data, json_file)
+
+	@staticmethod
+	def load_from_json():
+		diaries_address = 'diaries.json'
+		json_data = []
+		diaries = []
+		if os.path.isfile(diaries_address):
+			with open(diaries_address) as json_file:
+				json_data = json.load(json_file)
+		for json_entry in json_data:
+			diaries.append(Diary(id=json_entry['id'], url=json_entry['url'],
+				submission_id=json_entry['submission_id'], comments=json_entry['comments']))
+		return diaries
+
 class DiaryChecker:
 	def __init__(self, front_page_url, article_prefix, checked=[]):
 		self.checked = checked
@@ -120,11 +157,12 @@ class DiaryFetcher:
 		self.diary = diary
 		self.imgur_reuploader = imgur_reuploader
 		self.REDDIT_POST_LIMIT = REDDIT_POST_LIMIT # 10000
+		self.signature = '***\n^^This ^^is ^^a ^^bot. ^^Message ^^me ^^at ^^/u/yfox'
 
 	def fetch_and_parse(self):
 		self.fetch_content()
 		self.parse_message()
-		self.diary.message_mid.append('\n\n' + self.diary.stamp)
+		self.diary.message_mid.append('\n\n' + self.diary.stamp + '\n\n' + self.signature)
 		self.combine_message()
 
 	def fetch_content(self):
@@ -154,19 +192,19 @@ class DiaryFetcher:
 		self.diary.message_mid = []
 		self.diary.message_soup.contents
 		for tag in self.diary.message_soup.children:
-			str = self.parse_tag(tag)
-			if str == '\n\n':
+			string = self.parse_tag(tag)
+			if string == '\n\n':
 				if len(self.diary.message_mid) == 0 or self.diary.message_mid[-1] != '\n\n':
-					self.diary.message_mid.append(str)
+					self.diary.message_mid.append(string)
 			elif tag.name == 'ul' or tag.name == 'ol':
 				if len(self.diary.message_mid) == 0 or self.diary.message_mid[-1] != '\n\n':
 					self.diary.message_mid.append('\n\n')
-				self.diary.message_mid.append(str)
-			elif len(str) > 0:
+				self.diary.message_mid.append(string)
+			elif len(string) > 0:
 				if len(self.diary.message_mid) == 0 or self.diary.message_mid[-1] == '\n\n':
-					self.diary.message_mid.append('> ' + str)
+					self.diary.message_mid.append('> ' + string)
 				else:
-					self.diary.message_mid.append(str)
+					self.diary.message_mid.append(string)
 
 	def combine_message(self):
 		self.diary.messages_reddit = ['']
@@ -199,32 +237,38 @@ class DiaryFetcher:
 			return ans
 		elif tag.name == 'b':
 			if tag.string != None:
-				return '*' + self.clean_string(tag.string) + '*'
+				return ' **' + self.clean_string(tag.string).strip() + '** '
 			ans = ''
 			for child in tag.children:
 				ans += self.parse_tag(child)
-			return '*' + ans + '*'
+			return ' **' + ans.strip() + '** '
 		elif tag.name == 'i':
 			if tag.string != None:
-				return '**' + self.clean_string(tag.string) + '**'
+				return ' *' + self.clean_string(tag.string).strip() + '* '
 			ans = ''
 			for child in tag.children:
 				ans += self.parse_tag(child)
-			return '**' + ans + '**'
+			return ' *' + ans.strip() + '* '
 		elif tag.name == 'img':
 			for cl in tag['class']:
 				if cl == 'mceSmilieSprite':
 					return ''
 			regex = 'paradoxplaza'
 			src = tag['src']
-			if re.search(regex, src, flags=re.IGNORECASE):
+			if re.search('paradoxplaza', src, flags=re.IGNORECASE):
 				src = self.imgur_reuploader.upload(src)
 
 			if tag.string == None:
-				return '[' + src + '](' + src + ')'
+				return ' ' + src + ' '
 			else:
 				return '[' + self.clean_string(tag.string) + '](' + src + ')'
 		elif tag.name == 'a':
+			if len(tag.contents) == 1 and tag.contents[0].name == 'img':
+				src = tag['href']
+				if re.search('paradoxplaza', src, flags=re.IGNORECASE):
+					src = self.imgur_reuploader.upload(src)
+				return ' ' + src + ' '
+
 			ans = ''
 			for child in tag.children:
 				ans += self.parse_tag(child)
@@ -232,33 +276,37 @@ class DiaryFetcher:
 		elif tag.name == 'ul':
 			ans = ''
 			for child in tag.children:
-				str = self.parse_tag(child, list_prefix='> * ')
-				if len(str) > 0:
-					ans += '\n' + str
+				string = self.parse_tag(child, list_prefix='> * ')
+				if len(string) > 0:
+					ans += '\n' + string
 			return ans
 		elif tag.name == 'ol':
 			ans = ''
 			for index, child in enumerate(tag.contents):
-				str = self.parse_tag(child, list_prefix='>' + str(index+1)+'. ')
-				if len(str) > 0:
-					ans += '\n' + str
+				string = self.parse_tag(child, list_prefix='>' + str(index+1)+'. ')
+				if len(string) > 0:
+					ans += '\n' + string
 			return ans
 		elif tag.name == 'li':
 			ans = list_prefix
 			for child in tag.children:
 				ans += self.parse_tag(child)
 			return ans
-		else: # maybe raise an exception?
-			return self.clean_string(tag.string)
+		elif tag.name == 'iframe':
+			return ''
+		else:
+			logging.info('Unexpected tag: ' + str(tag))
+			if tag.string == None:
+				return ''
+			else:
+				return self.clean_string(tag.string)
 
-	def clean_string(self, str):
-		return self.regex_clean.sub(' ', str)
+	def clean_string(self, string):
+		return self.regex_clean.sub(' ', string)
 
 class DiaryPoster:
-	def __init__(self, user_agent, client_id, client_secret, resubmit=False, raise_captcha_exception=False):
+	def __init__(self, user_agent, resubmit=False, raise_captcha_exception=False):
 		self.user_agent = user_agent
-		self.client_id = client_id
-		self.client_secret = client_secret
 		self.set_posting_settings(resubmit, raise_captcha_exception)
 		self.login_to_reddit()
 
@@ -272,7 +320,6 @@ class DiaryPoster:
 
 	def login_to_reddit(self):
 		self.r = praw.Reddit(self.user_agent)
-		# self.r.set_oauth_app_info(client_id=self.client_id, client_secret=self.client_secret, redirect_uri='http://127.0.0.1:65010/authorize_callback')
 		OAuth2Util.OAuth2Util(self.r, server_mode=True)
 
 	def post_to_reddit(self, diary):
@@ -285,6 +332,7 @@ class DiaryPoster:
 		prev_msg = submission
 		for msg in diary.messages_reddit:
 			prev_msg = prev_msg.add_comment(msg)
+			diary.comments.append(prev_msg.id)
 		return True
 
 	def get_submission(self, diary):
@@ -296,7 +344,8 @@ class DiaryPoster:
 		except praw.errors.InvalidCaptcha:
 			logging.error('Invalid Captcha')
 			return None
-		return submission
+		diary.submission_id = submission.id
+		return submission 
 
 	def select_flair(self, submission, game):
 		subreddit_flair = self.flair_dict.get(game)
@@ -310,13 +359,30 @@ class DiaryPoster:
 		return False
 
 class ImgurReuploader:
-	def __init__(self, client_id, client_secret):
-		self.client = ImgurClient(client_id, client_secret)
+	def __init__(self, config_address = 'imgur.ini'):
+		self.images_address = 'images.json'
+		config = configparser.ConfigParser()
+		config.read(config_address)
+		self.client = ImgurClient(config["imgur"]["client_id"], config["imgur"]["client_secret"], config["imgur"]["access_token"], config["imgur"]["refresh_token"])
+		self.uploads = {}
+		self.load_from_json()
 
 	def upload(self, url):
+		if url in self.uploads:
+			return self.uploads[url]
 		final_url = requests.get(url).url
-		reupload = self.client.upload_from_url(final_url)
-		return reupload['link']
+		rehost = self.client.upload_from_url(final_url)
+		self.uploads[url] = rehost['link']
+		return rehost['link']
+
+	def save_to_json(self):
+		with open(self.images_address, 'w') as json_file:
+			json.dump(self.uploads, json_file)
+
+	def load_from_json(self):
+		if os.path.isfile(self.images_address):
+			with open(self.images_address) as json_file:
+				self.uploads = json.load(json_file)
 
 def main():
 	scheduler = BlockingScheduler()
@@ -327,5 +393,5 @@ def main():
 	except (KeyboardInterrupt, SystemExit):
 		pass
 
-if __name__ == "__main__":
-	main()
+# if __name__ == "__main__":
+# 	main()
